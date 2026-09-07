@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -163,17 +164,60 @@ type Options struct {
 // the per-server work channels are written by the dispatcher and
 // read by workers; the try-list has its own mutex.
 
-// ConnActivity describes what a single NNTP connection worker is doing
-// right now. Written only by the owning connWorker goroutine; read by
-// ServerStatus() under connActivityMu.RLock.
+// inflightArticle is one article currently on the wire for a connection
+// slot.
+//
+// It holds the request rather than copying its message-id, subject and
+// size, because a copy would be a second place for the same values to live
+// and drift. That is safe because an articleRequest is written once and
+// only once: every field is unexported, so nothing outside this package can
+// assign one, and the sole production construction site is tryDispatch —
+// `git grep -n 'req := &articleRequest{' internal/downloader/dispatch.go`
+// finds 1. Searching the package for an assignment to req.messageID,
+// req.subject or req.bytes outside _test.go files returned nothing when
+// this was written; the fields are set in that one composite literal.
+//
+// The pointer doubles as the entry's identity — tryDispatch allocates a
+// fresh request per dispatch, so it stays unique for the life of the fetch
+// and lets clearConnActivity remove exactly the entry its own handleRequest
+// added.
+type inflightArticle struct {
+	req   *articleRequest
+	since time.Time
+}
+
+// ConnActivity describes what a single NNTP connection slot is doing right
+// now.
+//
+// A slot is not one article. With pipelining_requests N a connWorker runs
+// up to N*2 concurrent handleRequest goroutines that all share one
+// workerID, so several articles can be on the wire for one slot at once.
+// inflight holds all of them, which is what makes the slot report busy
+// until the last one lands rather than the first.
+//
+// Read by ServerStatus() under connActivityMu.RLock.
 type ConnActivity struct {
 	ServerName string
 	ConnIndex  int
-	ArticleID  string    // message-id being fetched; "" = idle
-	Subject    string    // human-friendly file subject
-	Bytes      int       // expected article size
-	Since      time.Time // when this fetch started; zero = idle
-	Connected  bool      // true when the underlying TCP connection exists
+	Connected  bool // true when the underlying TCP connection exists
+
+	// inflight holds this slot's articles in start order, so index 0 is
+	// the longest-running. Empty means idle. Written by setConnActivity
+	// and clearConnActivity, both under connActivityMu.Lock.
+	inflight []inflightArticle
+}
+
+// oldest returns the longest-running in-flight article for the slot, and
+// whether one exists.
+//
+// ServerStatus reports this one rather than the newest because a slot's
+// elapsed time is only useful as a stall signal, and the newest article
+// resets it on every pipelined dispatch.
+func (ca *ConnActivity) oldest() (inflightArticle, bool) {
+	if len(ca.inflight) == 0 {
+		return inflightArticle{}, false
+	}
+	return ca.inflight[0], true
 }
 
 // ConnSnapshot is the JSON-serialisable view of a single connection.
@@ -182,11 +226,17 @@ type ConnActivity struct {
 // response (nested in ServerSnapshot.Connections). Do not remove or rename
 // a field without checking internal/api's field-contract test — see #96.
 type ConnSnapshot struct {
-	Index     int    `json:"index"`
+	Index int `json:"index"`
+	// ArticleID, Subject, Bytes and SinceUnix describe the OLDEST article
+	// on this connection. A pipelined connection carries several at once;
+	// InFlight says how many, so a reader can tell "one article" from
+	// "one of four" without the other three needing wire fields of their
+	// own. ArticleID == "" means the connection is idle and InFlight is 0.
 	ArticleID string `json:"article_id"`
 	Subject   string `json:"subject"`
 	Bytes     int    `json:"bytes"`
 	SinceUnix int64  `json:"since_unix"`
+	InFlight  int    `json:"in_flight"`
 	Connected bool   `json:"connected"`
 }
 
@@ -267,9 +317,11 @@ type Downloader struct {
 
 	tracker *dispatchTracker
 
-	// connActivityMu guards connActivity. Workers write their own
-	// entry via setConnActivity/clearConnActivity; ServerStatus()
-	// reads all entries under RLock.
+	// connActivityMu guards connActivity and the inflight slice inside
+	// every entry. handleRequest goroutines add and remove their own
+	// article via setConnActivity/clearConnActivity — several of them
+	// share one entry under pipelining — and ServerStatus() reads all
+	// entries under RLock.
 	connActivityMu sync.RWMutex
 	connActivity   map[string]*ConnActivity // key: "serverName#connIndex"
 
@@ -618,28 +670,33 @@ func (d *Downloader) disconnectChanFor(mc *managedConn, inFlight bool) <-chan st
 	return d.disconnectSnapshot()
 }
 
-// setConnActivity records that the worker identified by workerID is
-// now fetching the given article. Called at the start of handleRequest.
+// setConnActivity records that the slot identified by workerID has begun
+// fetching req. Called at the start of handleRequest.
 func (d *Downloader) setConnActivity(workerID string, req *articleRequest) {
 	d.connActivityMu.Lock()
 	if ca, ok := d.connActivity[workerID]; ok {
-		ca.ArticleID = req.messageID
-		ca.Subject = req.subject
-		ca.Bytes = req.bytes
-		ca.Since = time.Now()
+		ca.inflight = append(ca.inflight, inflightArticle{req: req, since: time.Now()})
 	}
 	d.connActivityMu.Unlock()
 }
 
-// clearConnActivity marks the worker as idle. Called via defer at the
-// end of handleRequest.
-func (d *Downloader) clearConnActivity(workerID string) {
+// clearConnActivity removes req from its slot, leaving that slot's other
+// pipelined articles in place. Called via defer at the end of
+// handleRequest.
+//
+// Removing one entry rather than resetting the slot is the whole point:
+// several handleRequest goroutines share a workerID under pipelining, and
+// a reset by whichever finished first marked a busy connection idle while
+// the rest were still on the wire.
+func (d *Downloader) clearConnActivity(workerID string, req *articleRequest) {
 	d.connActivityMu.Lock()
 	if ca, ok := d.connActivity[workerID]; ok {
-		ca.ArticleID = ""
-		ca.Subject = ""
-		ca.Bytes = 0
-		ca.Since = time.Time{}
+		for i := range ca.inflight {
+			if ca.inflight[i].req == req {
+				ca.inflight = slices.Delete(ca.inflight, i, i+1)
+				break
+			}
+		}
 	}
 	d.connActivityMu.Unlock()
 }
@@ -697,18 +754,23 @@ func (d *Downloader) ServerStatus() []ServerSnapshot {
 	d.connActivityMu.RLock()
 	activityByServer := make(map[string][]ConnSnapshot)
 	for _, ca := range d.connActivity {
-		var sinceUnix int64
-		if !ca.Since.IsZero() {
-			sinceUnix = ca.Since.Unix()
-		}
-		activityByServer[ca.ServerName] = append(activityByServer[ca.ServerName], ConnSnapshot{
+		snap := ConnSnapshot{
 			Index:     ca.ConnIndex,
-			ArticleID: ca.ArticleID,
-			Subject:   ca.Subject,
-			Bytes:     ca.Bytes,
-			SinceUnix: sinceUnix,
 			Connected: ca.Connected,
-		})
+		}
+		// A pipelined slot has several articles on the wire; report the
+		// oldest. ArticleID staying empty is what marks the slot idle,
+		// and it is how activeCount below counts busy connections.
+		if a, ok := ca.oldest(); ok {
+			snap.ArticleID = a.req.messageID
+			snap.Subject = a.req.subject
+			snap.Bytes = a.req.bytes
+			snap.InFlight = len(ca.inflight)
+			if !a.since.IsZero() {
+				snap.SinceUnix = a.since.Unix()
+			}
+		}
+		activityByServer[ca.ServerName] = append(activityByServer[ca.ServerName], snap)
 	}
 	d.connActivityMu.RUnlock()
 
@@ -738,6 +800,17 @@ func (d *Downloader) ServerStatus() []ServerSnapshot {
 			conns = []ConnSnapshot{}
 		}
 
+		// Busy CONNECTIONS, not articles in flight: a pipelined
+		// connection carrying several articles contributes one.
+		//
+		// ActiveConns therefore cannot exceed MaxConnections, and that
+		// holds by construction rather than by arithmetic here: New
+		// pre-populates connActivity with exactly max(srv.Connections(), 1)
+		// entries per enabled server, one per workerID. That insertion is
+		// the only one — `git grep -n 'd.connActivity\[wid\] = '
+		// internal/downloader` finds 1 — and a search of the package for
+		// `delete(` against this map returned nothing, so len(conns) stays
+		// that same figure, which is what MaxConnections reports.
 		activeCount := 0
 		for _, c := range conns {
 			if c.ArticleID != "" {
