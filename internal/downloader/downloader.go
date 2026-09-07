@@ -168,12 +168,19 @@ type Options struct {
 // slot.
 //
 // It holds the request rather than copying its message-id, subject and
-// size: nothing writes an articleRequest field after tryDispatch builds
-// it, so a copy here would be a second place for the same values to live
-// and drift. The pointer doubles as the entry's identity — tryDispatch
-// allocates a fresh request per dispatch, so it stays unique for the life
-// of the fetch and lets clearConnActivity remove exactly the entry its own
-// handleRequest added.
+// size, because a copy would be a second place for the same values to live
+// and drift. That is safe because an articleRequest is written once and
+// only once: every field is unexported, so nothing outside this package can
+// assign one, and the sole production construction site is tryDispatch —
+// `git grep -n 'req := &articleRequest{' internal/downloader/dispatch.go`
+// finds 1. Searching the package for an assignment to req.messageID,
+// req.subject or req.bytes outside _test.go files returned nothing when
+// this was written; the fields are set in that one composite literal.
+//
+// The pointer doubles as the entry's identity — tryDispatch allocates a
+// fresh request per dispatch, so it stays unique for the life of the fetch
+// and lets clearConnActivity remove exactly the entry its own handleRequest
+// added.
 type inflightArticle struct {
 	req   *articleRequest
 	since time.Time
@@ -794,8 +801,16 @@ func (d *Downloader) ServerStatus() []ServerSnapshot {
 		}
 
 		// Busy CONNECTIONS, not articles in flight: a pipelined
-		// connection carrying several articles contributes one, so
-		// ActiveConns never exceeds MaxConnections.
+		// connection carrying several articles contributes one.
+		//
+		// ActiveConns therefore cannot exceed MaxConnections, and that
+		// holds by construction rather than by arithmetic here: New
+		// pre-populates connActivity with exactly max(srv.Connections(), 1)
+		// entries per enabled server, one per workerID. That insertion is
+		// the only one — `git grep -n 'd.connActivity\[wid\] = '
+		// internal/downloader` finds 1 — and a search of the package for
+		// `delete(` against this map returned nothing, so len(conns) stays
+		// that same figure, which is what MaxConnections reports.
 		activeCount := 0
 		for _, c := range conns {
 			if c.ArticleID != "" {
