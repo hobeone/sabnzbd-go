@@ -1049,7 +1049,7 @@ func (p *JobProgress) markFailed(m *Manifest, i int) bool {
 // It reports whether it cleared article i's failed bit, which
 // ClearEmittedForReload aggregates into its `cleared` return. NO CALLER USES
 // THAT RETURN TODAY — `git grep -n 'j\.ClearEmittedForReload(' -- '*.go'
-// ':!*_test.go'` finds 2 lines, and both discard it. The per-article answer
+// ':!*_test.go'` finds 1 line, and discards it. The per-article answer
 // exists so that a caller CAN name the stored rows it may drop: now that the
 // reset is not exhaustive, a whole-job delete would forget an article that is
 // still failed in memory.
