@@ -698,7 +698,7 @@ func (j *Job) ApplyResolution(runs []RunRange, failed []int32) error {
 	return nil
 }
 
-// ClearEmittedForReload resets Emitted and Failed flags for reload/restart.
+// ClearEmittedForReload resets Emitted and Failed flags for reload.
 func (j *Job) ClearEmittedForReload(skipEmitted bool) (cleared, retained []int32) {
 	j.contentMu.Lock()
 	defer j.contentMu.Unlock()
