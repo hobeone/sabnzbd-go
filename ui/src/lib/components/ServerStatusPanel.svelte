@@ -112,6 +112,15 @@
 		return servers.reduce((sum, s) => sum + s.active_conns, 0);
 	}
 
+	// Articles on the wire, which is not the same as busy connections:
+	// pipelining_requests > 1 lets one connection carry several at once.
+	function totalInFlight(): number {
+		return servers.reduce(
+			(sum, s) => sum + s.connections.reduce((n, c) => n + c.in_flight, 0),
+			0
+		);
+	}
+
 	function totalMaxConns(): number {
 		return servers.reduce((sum, s) => sum + s.max_connections, 0);
 	}
@@ -154,6 +163,11 @@
 			<div class="text-center">
 				<div class="text-xs font-semibold uppercase tracking-wider text-m3-primary">Active</div>
 				<div class="mt-0.5 text-lg font-bold text-m3-on-surface">{totalActiveConns()} / {totalMaxConns()}</div>
+				{#if totalInFlight() > totalActiveConns()}
+					<div class="text-[10px] font-medium text-m3-on-surface-variant/70">
+						{totalInFlight()} articles in flight
+					</div>
+				{/if}
 			</div>
 			<div class="text-center">
 				<div class="text-xs font-semibold uppercase tracking-wider text-m3-primary">Servers</div>
@@ -180,6 +194,7 @@
 					<div class="flex items-stretch hover:bg-m3-surface-variant/20 transition-colors">
 						<button
 							onclick={() => toggleExpanded(server.name)}
+							aria-expanded={isExpanded}
 							class="flex flex-1 min-w-0 items-center gap-3.5 px-4 py-3 text-left"
 						>
 							<!-- Status dot -->
@@ -302,6 +317,14 @@
 												<span class="min-w-0 flex-1 truncate text-m3-on-surface font-medium" title={conn.subject || conn.article_id}>
 													{conn.subject || conn.article_id}
 												</span>
+												{#if conn.in_flight > 1}
+													<span
+														class="flex-shrink-0 rounded-full bg-m3-primary/15 px-1.5 py-0.5 font-mono text-[10px] font-bold text-m3-primary"
+														title="{conn.in_flight} articles pipelined on this connection; the one named is the oldest"
+													>
+														×{conn.in_flight}
+													</span>
+												{/if}
 												<span class="flex-shrink-0 text-m3-on-surface-variant/80 font-medium">{formatBytes(conn.bytes)}</span>
 												<span class="flex-shrink-0 font-mono text-m3-on-surface-variant/70">{connDuration(conn)}</span>
 											{:else if conn.connected}

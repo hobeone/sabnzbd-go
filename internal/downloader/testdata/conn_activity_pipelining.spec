@@ -16,3 +16,11 @@ file internal/downloader/downloader.go
 --- replace
 	return ca.inflight[len(ca.inflight)-1], true
 --- end
+
+[the slot reports one article rather than its true pipelined depth]
+file internal/downloader/downloader.go
+--- anchor
+			snap.InFlight = len(ca.inflight)
+--- replace
+			snap.InFlight = 1
+--- end

@@ -221,12 +221,15 @@ func (ca *ConnActivity) oldest() (inflightArticle, bool) {
 type ConnSnapshot struct {
 	Index int `json:"index"`
 	// ArticleID, Subject, Bytes and SinceUnix describe the OLDEST article
-	// on this connection; a pipelined connection carries several at once.
-	// ArticleID == "" means the connection is idle.
+	// on this connection. A pipelined connection carries several at once;
+	// InFlight says how many, so a reader can tell "one article" from
+	// "one of four" without the other three needing wire fields of their
+	// own. ArticleID == "" means the connection is idle and InFlight is 0.
 	ArticleID string `json:"article_id"`
 	Subject   string `json:"subject"`
 	Bytes     int    `json:"bytes"`
 	SinceUnix int64  `json:"since_unix"`
+	InFlight  int    `json:"in_flight"`
 	Connected bool   `json:"connected"`
 }
 
@@ -755,6 +758,7 @@ func (d *Downloader) ServerStatus() []ServerSnapshot {
 			snap.ArticleID = a.req.messageID
 			snap.Subject = a.req.subject
 			snap.Bytes = a.req.bytes
+			snap.InFlight = len(ca.inflight)
 			if !a.since.IsZero() {
 				snap.SinceUnix = a.since.Unix()
 			}

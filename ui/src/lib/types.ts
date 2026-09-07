@@ -217,10 +217,18 @@ export interface ConfigResponse {
 // Server status debug panel types
 export interface ConnSnapshot {
 	index: number;
+	/** The oldest article on this connection; empty when the connection is idle. */
 	article_id: string;
 	subject: string;
 	bytes: number;
 	since_unix: number;
+	/**
+	 * How many articles this connection currently has on the wire. With
+	 * `pipelining_requests > 1` a single connection carries several at once,
+	 * and article_id/subject/bytes/since_unix describe only the oldest of
+	 * them. 0 when idle.
+	 */
+	in_flight: number;
 	connected: boolean;
 }
 

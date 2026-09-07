@@ -994,6 +994,9 @@ func TestConnActivity_PipelinedSlotBusyUntilLastArticle(t *testing.T) {
 	if snap.ActiveConns != 1 {
 		t.Fatalf("ActiveConns with 3 articles on the wire = %d; want 1", snap.ActiveConns)
 	}
+	if snap.Connections[0].InFlight != 3 {
+		t.Errorf("InFlight with 3 articles on the wire = %d; want 3", snap.Connections[0].InFlight)
+	}
 
 	// The first article lands. Two are still outstanding, so the
 	// connection is still busy.
@@ -1001,6 +1004,9 @@ func TestConnActivity_PipelinedSlotBusyUntilLastArticle(t *testing.T) {
 	snap = d.ServerStatus()[0]
 	if snap.ActiveConns != 1 {
 		t.Errorf("ActiveConns after 1 of 3 completed = %d; want 1", snap.ActiveConns)
+	}
+	if snap.Connections[0].InFlight != 2 {
+		t.Errorf("InFlight after 1 of 3 completed = %d; want 2", snap.Connections[0].InFlight)
 	}
 	// The slot now reports the oldest survivor, not the completed article
 	// and not the newest.
@@ -1029,6 +1035,9 @@ func TestConnActivity_PipelinedSlotBusyUntilLastArticle(t *testing.T) {
 	}
 	if snap.Connections[0].SinceUnix != 0 {
 		t.Errorf("idle SinceUnix = %d; want 0", snap.Connections[0].SinceUnix)
+	}
+	if snap.Connections[0].InFlight != 0 {
+		t.Errorf("idle InFlight = %d; want 0", snap.Connections[0].InFlight)
 	}
 }
 
