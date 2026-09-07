@@ -619,6 +619,32 @@ data is what keeps the verdict independently testable with no queue at all.
 
 ### 8.1 Two pools, one ordering
 
+> **AMENDED 2026-09-07 — the two pools are built; the ordering is not.**
+> `internal/sched` implements pool A and pool B as specified. The
+> priority-ordered list this section gives them is **unbuilt**, and the
+> sentences below stating that priority orders anything describe intent rather
+> than behaviour at `4bae93df`. Measured on #456:
+>
+> - `git grep -c 'Priority' -- 'internal/sched/*.go'` → **0 files.** The
+>   scheduler never reads it.
+> - `Dispatcher.List()` and `snapshotOrder()` copy `d.order` with no sort. The
+>   only `slices.SortFunc` in `internal/dispatch` is `restore`'s
+>   `(SortKey, ID)` tiebreak, which reproduces *insertion* order across a
+>   restart.
+>
+> So both consumers below are served in **FIFO by insertion sequence**, and
+> `dispatch.Header.Priority` — written at ingest, persisted, mutated by
+> `Dispatcher.SetPriority`, rendered by the API — changes nothing. The one
+> behavioural use of job priority anywhere is `constants.PausedPriority` at
+> ingest mapping to `SetIntent(IntentPause)`.
+>
+> **The design below is not withdrawn — it is what #526 would build**, and the
+> "one ordering, two consumers" argument is exactly why the gap is worth
+> closing as one piece rather than two. §8.1.1's reorder semantics are unbuilt
+> for the same reason and are part of the same question: `entry.seq`'s comment
+> records that a reorder must renumber, and that this needs a whole-queue
+> resequence atomic in the store.
+
 - **Pool A — acquisition leases.** Bounds how many jobs may be working toward
   correct bytes. Held across the entire correctness loop, *including* while
   assessing and repairing.
@@ -737,19 +763,51 @@ that decision because it is the `Job`'s state that says "cancelled".
 
 ## 9. Dispatch
 
-One dispatcher, owned by the `Queue`, serving leased jobs in priority order.
+> **AMENDED 2026-09-07 — the goals of this section hold at `4bae93df`; three of
+> its named mechanisms do not, and two of those are refuted rather than
+> pending.** The re-measurement is on #456. What changed:
+>
+> - **`LeasedJobs` is struck.** The three properties this section asks for are
+>   satisfied today by `Downloader.buildDispatchPlan`
+>   (`internal/downloader/dispatch.go`), which walks the `[]dispatch.Row`
+>   snapshot returned by `Dispatcher.List()`. `git grep -n 'LeasedJobs' --
+>   '*.go'` returns nothing; introducing the interface now would rename a
+>   working seam rather than add a capability.
+> - **`NextArticle()`/`AddArticle()` as the sole funnels are struck.** The
+>   durability contract landed after this section was written and settled
+>   resolution against a single funnel: resolution enters through `AckDurable`
+>   *and*, on the resume path, through `SeedFromRuns`/`ReplaceFromRuns`, which
+>   reach `markDone` with no proof and no barrier. `docs/go-standards.md`
+>   states the consequence directly. The learn side is already single and is
+>   better served than `NextArticle` would serve it:
+>   `Job.ForEachUnfinishedArticle` (`internal/job/content.go`) is the
+>   counter-driven O(1)-skip form the hot path requires, where one-article-at-a-
+>   time would be a regression.
+> - **"in priority order" describes behaviour this codebase does not have.**
+>   See §8.1's banner: order is FIFO by insertion sequence, and #526 is the
+>   gap.
+>
+> **What survives is the line to hold** — the bolded paragraph below: the thing
+> that sees everything only reads. That property is what the section was for, and it
+> is true at HEAD by a mechanism this section never names.
+
+~~One dispatcher, owned by the `Queue`, serving leased jobs in priority
+order.~~ One dispatcher, reading an ordered snapshot of the registry.
 
 ```go
-// Everything the dispatcher needs, and nothing more.
+// STRUCK 2026-09-07 — never built, and no longer owed. See the banner above.
 type LeasedJobs interface {
     InPriorityOrder() []*Job  // snapshot; caller holds no lock
 }
 ```
 
-The `Job` still owns what is outstanding — `job.NextArticle()` is the only way
-to learn it and `job.AddArticle()` the only way to resolve it. The dispatcher
-is a **worker, not state**, and workers may be shared as long as they mutate
-only through the owner's methods.
+The `Job` still owns what is outstanding — ~~`job.NextArticle()` is the only
+way to learn it and `job.AddArticle()` the only way to resolve it~~ and the
+dispatcher reads that rather than tracking it. (No claim is made here about
+the size of the resolution surface; the struck clause made one, and the
+durability work refuted it.) The dispatcher is a **worker, not state**, and
+workers may be shared as long as they mutate only through the owner's
+methods.
 
 **The line to hold:** the dispatcher reads snapshots and holds no per-job state
 of its own. Any work-conserving scheduler must see all candidates — that is
@@ -771,7 +829,10 @@ Three properties fall out:
   penalties and the all-servers-exhausted verdict are inherently cross-job.
 
 The dispatcher lives in its own package, not inside `internal/queue`, and
-depends only on the read-only interface above.
+depends only on a read-only snapshot. Both halves hold at `4bae93df` by a
+different route than this section drew: `internal/queue` no longer exists, and
+the read-only surface is `Dispatcher.List() []Row` rather than the struck
+interface above.
 
 ---
 
@@ -785,7 +846,9 @@ manifest and a live barrier — none of it survives a restart.
 
 `Waiting{Next: Fetching}` for one that was fetching, `Waiting{Next:
 Extracting}` for one past the boundary. The Queue then issues leases up to the
-pool limits in priority order, exactly as at any other moment.
+pool limits in priority order (see §8.1's banner — that ordering is unbuilt;
+today it is insertion order, which `restore`'s `(SortKey, ID)` tiebreak
+reproduces deliberately), exactly as at any other moment.
 
 **Restart is not a special code path.** It is the ordinary scheduler starting
 from a cold pool. This is forced rather than remembered: the thing you would
@@ -866,6 +929,54 @@ second authority, and the stored copy is the one that drifts.
 ---
 
 ## 11. DirectUnpack: speculation with discard
+
+> **AMENDED 2026-09-07 — unbuilt, and no longer owed. #527 was filed to build
+> it and was closed as refuted.** There is no speculative area: `duOrch`
+> constructs the unpacker with the download directory as both the download and
+> the extract argument (`internal/app/directunpack_orchestrator.go`), so
+> extraction lands in place. There is no promote and no discard.
+>
+> What exists instead makes the opposite bet — DirectUnpack success is treated
+> as evidence strong enough for `stage_repair` to skip repair
+> (`directUnpackClean`). #527 argued that bet was unsafe. Tracing the chain
+> showed it is not, and the argument for building this section died with it:
+>
+> 1. **Per-article CRC32 at decode.** A `Done` article passed its yEnc
+>    checksum.
+> 2. **`MarkCorrupt` runs before `Add`.** `duOrch.maybeStart` calls
+>    `hasFailedArticle` per volume; any permanently failed article marks the
+>    whole set corrupt, and `directunpack.MarkCorrupt`'s contract is absolute —
+>    *"Once marked, the set can never be reported as successfully extracted"*
+>    (`internal/directunpack/directunpack.go:203-226`).
+>    The set lands in `DirectUnpackFailures`, so `directUnpackClean` is false.
+> 3. **The skip's gate is `QuickCheckNotRun`**, which means *"the stage was
+>    disabled or found no par2 sets to check against"*
+>    (`internal/postproc/stages.go:31-33`). #314 inverted the default so
+>    that once par2 sets are known to exist the state is
+>    `QuickCheckInconclusive`.
+>
+> The skip therefore fires only where there is no par2 to repair with — where
+> repair had nothing to do. `internal/postproc/stage_repair.go:94-98` says so
+> in the clause #527 read past: DirectUnpack reports only whether it *"could
+> mechanically walk the archive's entries, not whether the source data"* was
+> complete — *"so it may stand in for verification only where there is no
+> verification to be had."* #527 quoted the first half and stopped at the
+> comma.
+>
+> The half-download case reaches the same place: the assembler fires
+> `OnFileComplete` once every article is *resolved* (`Done` or `Failed`), so
+> `hasFailedArticle` is true, the set is a failure, repair runs, and
+> `handleDirectUnpack` — which iterates `DirectUnpackSets` only — leaves it for
+> the normal unpack stage to re-extract afterwards.
+>
+> **What is not claimed:** that in-place extraction is free of consequence. A
+> set that *is* marked corrupt leaves partial output in the download directory
+> before re-extraction, and whether that collides or is harmlessly overwritten
+> turns on `OverwriteFiles`, which has not been traced. That is housekeeping,
+> there is no user report of it, and it is not a reason to build this section.
+>
+> The reasoning below is kept because it remains the right shape *if* the bet
+> ever needs changing — but the bet is currently sound, so nothing is owed.
 
 DirectUnpack is a production activity running during acquisition — which
 appears to violate §4's one-way boundary. It does not, because **the boundary
@@ -984,6 +1095,45 @@ consequences were not chased.
 
 ## 15. Implementation decomposition
 
+> **COMPLETE 2026-09-07. Plans 1 and 2 landed; plan 3 is struck in full and
+> nothing replaces it.** Measured at `4bae93df` — see the plan 3
+> re-measurement on #456, and the per-item table below.
+>
+> **Plan 1** landed (#439, #447). **Plan 2** landed; every item its corrected
+> 2026-09-03 owes-table listed is present at `4bae93df`:
+>
+> | Owed by plan 2 | At `4bae93df` |
+> |---|---|
+> | `Manifest`/`JobProgress` rehomed into `internal/job` | present |
+> | the `internal/dispatch` residency enumeration test | `manifest_boundary_test.go`'s `TestDispatchNamesNoManifestType`, whose own comment names it *"the residency boundary, demoted from a compiler guarantee to a test one when Manifest moved into internal/job"* |
+> | `Checkpointer` (sized at six single-job writers) | `internal/checkpoint/checkpointer.go`; `git grep -n 'store\.Update(' -- '*.go' ':!*_test.go'` returns 0 lines |
+> | `app`/`downloader`/`postproc` rewired | done |
+> | the Deletes column | `internal/queue` does not exist |
+> | repoint the `quickcheck` stage | no `job.Queue` reads remain in it |
+> | `Row.Status()` | `internal/dispatch/status.go` |
+> | `Dispatcher.Row(id)` | `internal/dispatch/registry.go` |
+>
+> **Plan 3 did not become work — each of its four items ended for a different
+> reason**, which is why it is struck rather than deferred:
+>
+> | Plan 3 item | Outcome |
+> |---|---|
+> | the Queue-owned dispatcher over `LeasedJobs` | **satisfied by another mechanism** — §9's banner. `buildDispatchPlan` over `Dispatcher.List()` meets all three of §9's properties; `LeasedJobs` has no hits repo-wide |
+> | `job.NextArticle()` / `AddArticle()` | **refuted** — §9's banner. The durability contract settled resolution against a single funnel *after* §9 was written, and `ForEachUnfinishedArticle` already serves the learn side better |
+> | *Deletes:* `dispatchPass`'s queue-walking article loop | **target gone** — the swap rewrote it. `buildDispatchPlan` walks the registry snapshot, and per-article iteration is `Job.ForEachUnfinishedArticle` |
+> | DirectUnpack promote/discard | **not owed** — §11's banner. #527 was filed to build it and closed as refuted: the bet today's design makes is sound |
+>
+> **The one gap in this area is not in the table above**, because §15 never
+> recorded it: **priority is stored, persisted, settable and rendered, and
+> orders nothing** (§8.1's banner, #526). Order is FIFO by insertion sequence.
+> That is now the only open work this design implies.
+>
+> The general lesson, recorded because it cost nothing here and would have cost
+> a great deal if skipped: **a plan row written before the change beneath it
+> should be re-measured before it is planned, not merely implemented.** #491
+> established this; plan 3 is the second instance, and none of its four items
+> could have been predicted from the row.
+
 **Rip and replace, not migrate.** This supersedes an earlier seven-phase
 decomposition that staged the work as behaviour-preserving refactors with the
 old model surviving alongside the new one. That approach was rejected on
@@ -994,7 +1144,8 @@ to preserving it carefully.
 
 Three plans. The distinction that matters is **build-beside versus swap**:
 plan 1 adds a package nothing imports, plan 2 swaps the world onto it and
-deletes the old model in the same change, plan 3 follows behind. Building
+deletes the old model in the same change, plan 3 follows behind (it did not —
+see the banner above; plan 3 is struck). Building
 beside is not staging a migration — nothing in plan 1 is an adapter, a dual
 path, or a compatibility layer. It is the target vocabulary, written first so
 that plan 2's deletions have somewhere to land.
@@ -1003,7 +1154,7 @@ that plan 2's deletions have somewhere to land.
 |---|---|---|---|
 | 1 | **Lifecycle core** — `internal/job` | `State`/`Activity`/`Outcome`/`Policy`/`WaitReason`, the transition machine, `Attempt`, `Job` with its own lock, `ToSABnzbd` | nothing — the package is standalone and unimported |
 | 2 | **The swap** | `Manifest`/`JobProgress` move into `internal/job`; `Lease`; ~~`Assess` in `internal/par2`~~ **(landed ahead of the swap: #494, #495, #507)** — `Verdict` **was not built and is not owed**, see §1.2's second amendment; the new `Queue` with two pools and lease issuance; `Checkpointer`; ~~barrier self-reconciliation~~ **(§10.1 superseded — not owed)**; `app`/`downloader`/`postproc` rewired | `queue/status.go`, `JobPhase`, `ActiveSet`, `PromoteNext`, `evictJobLocked`, `SetStatus`/`SetStatusIf`, `SetPostProcStarted`, `Queue.Retry`, ~~`par2NeedsRecovery`~~ **(landed #494/#495 — now `app.par2Verdict`)**, `maybeReleaseRecoveryVolumes`, ~~`NeedRequeue`/`RequeueBlocksNeeded`~~ **(deleted #507)**, ~~`resumeAllJobs`~~ **(§10.1 — it is the mechanism, not a casualty)**, `shouldSkipForPP`, `Job.PostProc` |
-| 3 | **Dispatch and speculation** | `job.NextArticle()`/`AddArticle()`, the Queue-owned dispatcher over `LeasedJobs`, DirectUnpack promote/discard | `dispatchPass`'s queue-walking article loop, `duOrch`'s current wiring |
+| 3 | ~~**Dispatch and speculation**~~ **— struck 2026-09-07, see the banner below** | ~~`job.NextArticle()`/`AddArticle()`, the Queue-owned dispatcher over `LeasedJobs`, DirectUnpack promote/discard~~ | ~~`dispatchPass`'s queue-walking article loop, `duOrch`'s current wiring~~ |
 
 > **One entry was removed from plan 2's Deletes column on 2026-09-03 rather
 > than struck through: the `quickcheck` stage.** A strike-through here means
@@ -1104,7 +1255,9 @@ that plan 2's deletions have somewhere to land.
 > | ~~`NeedsMore(blocks)` / "repair never fails for insufficiency"~~ | **not owed** — §5's banner; it is `docs/post-processing-contract.md`'s Block-Exact Promotion gap, not a plan 2 deliverable |
 >
 > Sequence: **~~`Assess`/`Verdict`~~ (landed: #494, #495, #507) → plan 2 →
-> plan 3.** The precondition is met; plan 2 is writable.
+> ~~plan 3~~.** The precondition is met; plan 2 is writable. *(Superseded
+> 2026-09-07 by the banner at the head of this section: plan 2 landed, and
+> plan 3 is struck rather than next.)*
 >
 > ---
 >
