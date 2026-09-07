@@ -1554,8 +1554,19 @@ articles or sparse regions.
   crosses the `SyncTarget` interface, so the assembler still owes the first.
   `OnWriteFault` used to carry a single article index and do both, so every
   batch failure reported one article and rolled the rest back silently: they
-  were left neither Done, nor Failed, nor Outstanding, and only a restart's
-  `ClearEmittedForReload` recovered them.
+  were left neither Done, nor Failed, nor Outstanding, and only a restart
+  recovered them — at the time, through the `ClearEmittedForReload` sweep that
+  `Application.Start` then ran.
+
+  **That sweep is gone (#523), and this sentence is history rather than a live
+  recovery path.** A restart still recovers such an article, but by NOT
+  persisting the Emitted bit rather than by clearing it: `jobProgressJSON` has
+  no `emitted` field (`internal/job/progress.go`), so nothing has to run for it
+  to hold. `ClearEmittedForReload` is reached only from `ReloadDownloader`
+  now — `git grep -n 'j\.ClearEmittedForReload(' -- '*.go' ':!*_test.go'` finds
+  1 line, `internal/app/reloader.go:257`. For the two things that clear an
+  Emitted bit, and why neither is on the write-fault path, see
+  `Options.OnArticlesUnwritten`'s comment in `internal/assembler/assembler.go`.
 
   A rolled-back article also **gives back its part**. `partsWritten` is
   incremented when an article is *accepted*, so leaving the count in place put
